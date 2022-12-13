@@ -30,15 +30,15 @@ const pageHeaderSize = 16
 
 // meta represents a simplified version of a database meta page for testing.
 type meta struct {
-	magic    uint32
-	version  uint32
-	_        uint32
-	_        uint32
-	_        [16]byte
-	_        uint64
-	pgid     uint64
-	_        uint64
-	checksum uint64
+	_       uint32
+	version uint32
+	_       uint32
+	_       uint32
+	_       [16]byte
+	_       uint64
+	pgid    uint64
+	_       uint64
+	_       uint64
 }
 
 // Ensure that a database can be opened without error.
@@ -647,8 +647,14 @@ func TestDB_Concurrent_WriteTo(t *testing.T) {
 			panic(err)
 		}
 		time.Sleep(time.Duration(rand.Intn(20)+1) * time.Millisecond)
-		tx.WriteTo(f)
-		tx.Rollback()
+		_, err = tx.WriteTo(f)
+		if err != nil {
+			panic(err)
+		}
+		err = tx.Rollback()
+		if err != nil {
+			panic(err)
+		}
 		f.Close()
 		snap := &DB{nil, f.Name(), o}
 		snap.MustReopen()
