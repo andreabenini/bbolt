@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 	"unsafe"
+
+	"go.etcd.io/bbolt/internal/guts_cli"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -38,9 +41,6 @@ var (
 	// ErrInvalidValue is returned when a benchmark reads an unexpected value.
 	ErrInvalidValue = errors.New("invalid value")
 
-	// ErrCorrupt is returned when a checking a data file finds errors.
-	ErrCorrupt = errors.New("invalid value")
-
 	// ErrNonDivisibleBatchSize is returned when the batch size can't be evenly
 	// divided by the iteration count.
 	ErrNonDivisibleBatchSize = errors.New("number of iterations must be divisible by the batch size")
@@ -61,9 +61,6 @@ var (
 	ErrKeyNotFound = errors.New("key not found")
 )
 
-// PageHeaderSize represents the size of the bolt.page header.
-const PageHeaderSize = 16
-
 func main() {
 	m := NewMain()
 	if err := m.Run(os.Args[1:]...); err == ErrUsage {
@@ -74,19 +71,25 @@ func main() {
 	}
 }
 
-// Main represents the main program execution.
-type Main struct {
+type baseCommand struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 }
 
+// Main represents the main program execution.
+type Main struct {
+	baseCommand
+}
+
 // NewMain returns a new instance of Main connect to the standard input/output.
 func NewMain() *Main {
 	return &Main{
-		Stdin:  os.Stdin,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		baseCommand: baseCommand{
+			Stdin:  os.Stdin,
+			Stdout: os.Stdout,
+			Stderr: os.Stderr,
+		},
 	}
 }
 
@@ -127,6 +130,8 @@ func (m *Main) Run(args ...string) error {
 		return newPagesCommand(m).Run(args[1:]...)
 	case "stats":
 		return newStatsCommand(m).Run(args[1:]...)
+	case "surgery":
+		return newSurgeryCommand(m).Run(args[1:]...)
 	default:
 		return ErrUnknownCommand
 	}
@@ -156,29 +161,26 @@ The commands are:
     pages       print list of pages with their types
     page-item   print the key and value of a page item.
     stats       iterate over all pages and generate usage stats
+    surgery     perform surgery on bbolt database
 
 Use "bbolt [command] -h" for more information about a command.
 `, "\n")
 }
 
-// CheckCommand represents the "check" command execution.
-type CheckCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// checkCommand represents the "check" command execution.
+type checkCommand struct {
+	baseCommand
 }
 
-// NewCheckCommand returns a CheckCommand.
-func newCheckCommand(m *Main) *CheckCommand {
-	return &CheckCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newCheckCommand returns a checkCommand.
+func newCheckCommand(m *Main) *checkCommand {
+	c := &checkCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *CheckCommand) Run(args ...string) error {
+func (cmd *checkCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -198,7 +200,10 @@ func (cmd *CheckCommand) Run(args ...string) error {
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{
+		ReadOnly:        true,
+		PreLoadFreelist: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -207,7 +212,7 @@ func (cmd *CheckCommand) Run(args ...string) error {
 	// Perform consistency check.
 	return db.View(func(tx *bolt.Tx) error {
 		var count int
-		for err := range tx.Check() {
+		for err := range tx.Check(CmdKvStringer()) {
 			fmt.Fprintln(cmd.Stdout, err)
 			count++
 		}
@@ -215,7 +220,7 @@ func (cmd *CheckCommand) Run(args ...string) error {
 		// Print summary of errors.
 		if count > 0 {
 			fmt.Fprintf(cmd.Stdout, "%d errors found\n", count)
-			return ErrCorrupt
+			return guts_cli.ErrCorrupt
 		}
 
 		// Notify user that database is valid.
@@ -225,7 +230,7 @@ func (cmd *CheckCommand) Run(args ...string) error {
 }
 
 // Usage returns the help message.
-func (cmd *CheckCommand) Usage() string {
+func (cmd *checkCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt check PATH
 
@@ -238,24 +243,20 @@ return after all pages have been checked.
 `, "\n")
 }
 
-// InfoCommand represents the "info" command execution.
-type InfoCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// infoCommand represents the "info" command execution.
+type infoCommand struct {
+	baseCommand
 }
 
-// NewInfoCommand returns a InfoCommand.
-func newInfoCommand(m *Main) *InfoCommand {
-	return &InfoCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newInfoCommand returns a infoCommand.
+func newInfoCommand(m *Main) *infoCommand {
+	c := &infoCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *InfoCommand) Run(args ...string) error {
+func (cmd *infoCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -275,7 +276,7 @@ func (cmd *InfoCommand) Run(args ...string) error {
 	}
 
 	// Open the database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return err
 	}
@@ -289,7 +290,7 @@ func (cmd *InfoCommand) Run(args ...string) error {
 }
 
 // Usage returns the help message.
-func (cmd *InfoCommand) Usage() string {
+func (cmd *infoCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt info PATH
 
@@ -297,24 +298,20 @@ Info prints basic information about the Bolt database at PATH.
 `, "\n")
 }
 
-// DumpCommand represents the "dump" command execution.
-type DumpCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// dumpCommand represents the "dump" command execution.
+type dumpCommand struct {
+	baseCommand
 }
 
-// newDumpCommand returns a DumpCommand.
-func newDumpCommand(m *Main) *DumpCommand {
-	return &DumpCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newDumpCommand returns a dumpCommand.
+func newDumpCommand(m *Main) *dumpCommand {
+	c := &dumpCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *DumpCommand) Run(args ...string) error {
+func (cmd *dumpCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -334,7 +331,7 @@ func (cmd *DumpCommand) Run(args ...string) error {
 	}
 
 	// Read page ids.
-	pageIDs, err := atois(fs.Args()[1:])
+	pageIDs, err := stringToPages(fs.Args()[1:])
 	if err != nil {
 		return err
 	} else if len(pageIDs) == 0 {
@@ -342,7 +339,7 @@ func (cmd *DumpCommand) Run(args ...string) error {
 	}
 
 	// Open database to retrieve page size.
-	pageSize, err := ReadPageSize(path)
+	pageSize, _, err := guts_cli.ReadPageAndHWMSize(path)
 	if err != nil {
 		return err
 	}
@@ -362,7 +359,7 @@ func (cmd *DumpCommand) Run(args ...string) error {
 		}
 
 		// Print page to stdout.
-		if err := cmd.PrintPage(cmd.Stdout, f, pageID, pageSize); err != nil {
+		if err := cmd.PrintPage(cmd.Stdout, f, pageID, uint64(pageSize)); err != nil {
 			return err
 		}
 	}
@@ -371,22 +368,22 @@ func (cmd *DumpCommand) Run(args ...string) error {
 }
 
 // PrintPage prints a given page as hexadecimal.
-func (cmd *DumpCommand) PrintPage(w io.Writer, r io.ReaderAt, pageID int, pageSize int) error {
+func (cmd *dumpCommand) PrintPage(w io.Writer, r io.ReaderAt, pageID uint64, pageSize uint64) error {
 	const bytesPerLineN = 16
 
 	// Read page into buffer.
 	buf := make([]byte, pageSize)
-	addr := pageID * pageSize
+	addr := pageID * uint64(pageSize)
 	if n, err := r.ReadAt(buf, int64(addr)); err != nil {
 		return err
-	} else if n != pageSize {
+	} else if uint64(n) != pageSize {
 		return io.ErrUnexpectedEOF
 	}
 
 	// Write out to writer in 16-byte lines.
 	var prev []byte
 	var skipped bool
-	for offset := 0; offset < pageSize; offset += bytesPerLineN {
+	for offset := uint64(0); offset < pageSize; offset += bytesPerLineN {
 		// Retrieve current 16-byte line.
 		line := buf[offset : offset+bytesPerLineN]
 		isLastLine := (offset == (pageSize - bytesPerLineN))
@@ -416,7 +413,7 @@ func (cmd *DumpCommand) PrintPage(w io.Writer, r io.ReaderAt, pageID int, pageSi
 }
 
 // Usage returns the help message.
-func (cmd *DumpCommand) Usage() string {
+func (cmd *dumpCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt dump PATH pageid [pageid...]
 
@@ -424,20 +421,16 @@ Dump prints a hexadecimal dump of one or more pages.
 `, "\n")
 }
 
-// PageItemCommand represents the "page-item" command execution.
-type PageItemCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// pageItemCommand represents the "page-item" command execution.
+type pageItemCommand struct {
+	baseCommand
 }
 
-// newPageItemCommand returns a PageItemCommand.
-func newPageItemCommand(m *Main) *PageItemCommand {
-	return &PageItemCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newPageItemCommand returns a pageItemCommand.
+func newPageItemCommand(m *Main) *pageItemCommand {
+	c := &pageItemCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 type pageItemOptions struct {
@@ -448,13 +441,13 @@ type pageItemOptions struct {
 }
 
 // Run executes the command.
-func (cmd *PageItemCommand) Run(args ...string) error {
+func (cmd *pageItemCommand) Run(args ...string) error {
 	// Parse flags.
 	options := &pageItemOptions{}
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	fs.BoolVar(&options.keyOnly, "key-only", false, "Print only the key")
 	fs.BoolVar(&options.valueOnly, "value-only", false, "Print only the value")
-	fs.StringVar(&options.format, "format", "ascii-encoded", "Output format. One of: ascii-encoded|hex|bytes")
+	fs.StringVar(&options.format, "format", "ascii-encoded", "Output format. One of: "+FORMAT_MODES)
 	fs.BoolVar(&options.help, "h", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -476,13 +469,13 @@ func (cmd *PageItemCommand) Run(args ...string) error {
 	}
 
 	// Read page id.
-	pageID, err := strconv.Atoi(fs.Arg(1))
+	pageID, err := strconv.ParseUint(fs.Arg(1), 10, 64)
 	if err != nil {
 		return err
 	}
 
 	// Read item id.
-	itemID, err := strconv.Atoi(fs.Arg(2))
+	itemID, err := strconv.ParseUint(fs.Arg(2), 10, 64)
 	if err != nil {
 		return err
 	}
@@ -495,7 +488,7 @@ func (cmd *PageItemCommand) Run(args ...string) error {
 	defer func() { _ = f.Close() }()
 
 	// Retrieve page info and page size.
-	_, buf, err := ReadPage(path, pageID)
+	_, buf, err := guts_cli.ReadPage(path, pageID)
 	if err != nil {
 		return err
 	}
@@ -516,62 +509,80 @@ func (cmd *PageItemCommand) Run(args ...string) error {
 }
 
 // leafPageElement retrieves a leaf page element.
-func (cmd *PageItemCommand) leafPageElement(pageBytes []byte, index uint16) (*leafPageElement, error) {
-	p := (*page)(unsafe.Pointer(&pageBytes[0]))
-	if index >= p.count {
-		return nil, fmt.Errorf("leafPageElement: expected item index less than %d, but got %d.", p.count, index)
+func (cmd *pageItemCommand) leafPageElement(pageBytes []byte, index uint16) (*guts_cli.LeafPageElement, error) {
+	p := (*guts_cli.Page)(unsafe.Pointer(&pageBytes[0]))
+	if index >= p.Count() {
+		return nil, fmt.Errorf("leafPageElement: expected item index less than %d, but got %d.", p.Count(), index)
 	}
 	if p.Type() != "leaf" {
 		return nil, fmt.Errorf("leafPageElement: expected page type of 'leaf', but got '%s'", p.Type())
 	}
-	return p.leafPageElement(index), nil
+	return p.LeafPageElement(index), nil
 }
 
-// writeBytes writes the byte to the writer. Supported formats: ascii-encoded, hex, bytes.
-func (cmd *PageItemCommand) writeBytes(w io.Writer, b []byte, format string) error {
+const FORMAT_MODES = "auto|ascii-encoded|hex|bytes|redacted"
+
+// formatBytes converts bytes into string according to format.
+// Supported formats: ascii-encoded, hex, bytes.
+func formatBytes(b []byte, format string) (string, error) {
 	switch format {
 	case "ascii-encoded":
-		_, err := fmt.Fprintf(w, "%q", b)
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(w, "\n")
-		return err
+		return fmt.Sprintf("%q", b), nil
 	case "hex":
-		_, err := fmt.Fprintf(w, "%x", b)
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(w, "\n")
-		return err
+		return fmt.Sprintf("%x", b), nil
 	case "bytes":
-		_, err := w.Write(b)
-		return err
+		return string(b), nil
+	case "auto":
+		return bytesToAsciiOrHex(b), nil
+	case "redacted":
+		return fmt.Sprintf("<redacted len:%d>", len(b)), nil
 	default:
-		return fmt.Errorf("writeBytes: unsupported format: %s", format)
+		return "", fmt.Errorf("formatBytes: unsupported format: %s", format)
 	}
+}
+
+func parseBytes(str string, format string) ([]byte, error) {
+	switch format {
+	case "ascii-encoded":
+		return []byte(str), nil
+	case "hex":
+		return hex.DecodeString(str)
+	default:
+		return nil, fmt.Errorf("parseBytes: unsupported format: %s", format)
+	}
+}
+
+// writelnBytes writes the byte to the writer. Supported formats: ascii-encoded, hex, bytes, auto, redacted.
+// Terminates the write with a new line symbol;
+func writelnBytes(w io.Writer, b []byte, format string) error {
+	str, err := formatBytes(b, format)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, str)
+	return err
 }
 
 // PrintLeafItemKey writes the bytes of a leaf element's key.
-func (cmd *PageItemCommand) PrintLeafItemKey(w io.Writer, pageBytes []byte, index uint16, format string) error {
+func (cmd *pageItemCommand) PrintLeafItemKey(w io.Writer, pageBytes []byte, index uint16, format string) error {
 	e, err := cmd.leafPageElement(pageBytes, index)
 	if err != nil {
 		return err
 	}
-	return cmd.writeBytes(w, e.key(), format)
+	return writelnBytes(w, e.Key(), format)
 }
 
 // PrintLeafItemKey writes the bytes of a leaf element's value.
-func (cmd *PageItemCommand) PrintLeafItemValue(w io.Writer, pageBytes []byte, index uint16, format string) error {
+func (cmd *pageItemCommand) PrintLeafItemValue(w io.Writer, pageBytes []byte, index uint16, format string) error {
 	e, err := cmd.leafPageElement(pageBytes, index)
 	if err != nil {
 		return err
 	}
-	return cmd.writeBytes(w, e.value(), format)
+	return writelnBytes(w, e.Value(), format)
 }
 
 // Usage returns the help message.
-func (cmd *PageItemCommand) Usage() string {
+func (cmd *pageItemCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt page-item [options] PATH pageid itemid
 
@@ -582,276 +593,26 @@ Additional options include:
 	--value-only
 		Print only the value
 	--format
-		Output format. One of: ascii-encoded|hex|bytes (default=ascii-encoded)
+		Output format. One of: `+FORMAT_MODES+` (default=ascii-encoded)
 
 page-item prints a page item key and value.
 `, "\n")
 }
 
-// PageCommand represents the "page" command execution.
-type PageCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// pagesCommand represents the "pages" command execution.
+type pagesCommand struct {
+	baseCommand
 }
 
-// newPageCommand returns a PageCommand.
-func newPageCommand(m *Main) *PageCommand {
-	return &PageCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newPagesCommand returns a pagesCommand.
+func newPagesCommand(m *Main) *pagesCommand {
+	c := &pagesCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *PageCommand) Run(args ...string) error {
-	// Parse flags.
-	fs := flag.NewFlagSet("", flag.ContinueOnError)
-	help := fs.Bool("h", false, "")
-	if err := fs.Parse(args); err != nil {
-		return err
-	} else if *help {
-		fmt.Fprintln(cmd.Stderr, cmd.Usage())
-		return ErrUsage
-	}
-
-	// Require database path and page id.
-	path := fs.Arg(0)
-	if path == "" {
-		return ErrPathRequired
-	} else if _, err := os.Stat(path); os.IsNotExist(err) {
-		return ErrFileNotFound
-	}
-
-	// Read page ids.
-	pageIDs, err := atois(fs.Args()[1:])
-	if err != nil {
-		return err
-	} else if len(pageIDs) == 0 {
-		return ErrPageIDRequired
-	}
-
-	// Open database file handler.
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	// Print each page listed.
-	for i, pageID := range pageIDs {
-		// Print a separator.
-		if i > 0 {
-			fmt.Fprintln(cmd.Stdout, "===============================================")
-		}
-
-		// Retrieve page info and page size.
-		p, buf, err := ReadPage(path, pageID)
-		if err != nil {
-			return err
-		}
-
-		// Print basic page info.
-		fmt.Fprintf(cmd.Stdout, "Page ID:    %d\n", p.id)
-		fmt.Fprintf(cmd.Stdout, "Page Type:  %s\n", p.Type())
-		fmt.Fprintf(cmd.Stdout, "Total Size: %d bytes\n", len(buf))
-
-		// Print type-specific data.
-		switch p.Type() {
-		case "meta":
-			err = cmd.PrintMeta(cmd.Stdout, buf)
-		case "leaf":
-			err = cmd.PrintLeaf(cmd.Stdout, buf)
-		case "branch":
-			err = cmd.PrintBranch(cmd.Stdout, buf)
-		case "freelist":
-			err = cmd.PrintFreelist(cmd.Stdout, buf)
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// PrintMeta prints the data from the meta page.
-func (cmd *PageCommand) PrintMeta(w io.Writer, buf []byte) error {
-	m := (*meta)(unsafe.Pointer(&buf[PageHeaderSize]))
-	fmt.Fprintf(w, "Version:    %d\n", m.version)
-	fmt.Fprintf(w, "Page Size:  %d bytes\n", m.pageSize)
-	fmt.Fprintf(w, "Flags:      %08x\n", m.flags)
-	fmt.Fprintf(w, "Root:       <pgid=%d>\n", m.root.root)
-	fmt.Fprintf(w, "Freelist:   <pgid=%d>\n", m.freelist)
-	fmt.Fprintf(w, "HWM:        <pgid=%d>\n", m.pgid)
-	fmt.Fprintf(w, "Txn ID:     %d\n", m.txid)
-	fmt.Fprintf(w, "Checksum:   %016x\n", m.checksum)
-	fmt.Fprintf(w, "\n")
-	return nil
-}
-
-// PrintLeaf prints the data for a leaf page.
-func (cmd *PageCommand) PrintLeaf(w io.Writer, buf []byte) error {
-	p := (*page)(unsafe.Pointer(&buf[0]))
-
-	// Print number of items.
-	fmt.Fprintf(w, "Item Count: %d\n", p.count)
-	fmt.Fprintf(w, "\n")
-
-	// Print each key/value.
-	for i := uint16(0); i < p.count; i++ {
-		e := p.leafPageElement(i)
-
-		// Format key as string.
-		var k string
-		if isPrintable(string(e.key())) {
-			k = fmt.Sprintf("%q", string(e.key()))
-		} else {
-			k = fmt.Sprintf("%x", string(e.key()))
-		}
-
-		// Format value as string.
-		var v string
-		if (e.flags & uint32(bucketLeafFlag)) != 0 {
-			b := (*bucket)(unsafe.Pointer(&e.value()[0]))
-			v = fmt.Sprintf("<pgid=%d,seq=%d>", b.root, b.sequence)
-		} else if isPrintable(string(e.value())) {
-			v = fmt.Sprintf("%q", string(e.value()))
-		} else {
-			v = fmt.Sprintf("%x", string(e.value()))
-		}
-
-		fmt.Fprintf(w, "%s: %s\n", k, v)
-	}
-	fmt.Fprintf(w, "\n")
-	return nil
-}
-
-// PrintBranch prints the data for a leaf page.
-func (cmd *PageCommand) PrintBranch(w io.Writer, buf []byte) error {
-	p := (*page)(unsafe.Pointer(&buf[0]))
-
-	// Print number of items.
-	fmt.Fprintf(w, "Item Count: %d\n", p.count)
-	fmt.Fprintf(w, "\n")
-
-	// Print each key/value.
-	for i := uint16(0); i < p.count; i++ {
-		e := p.branchPageElement(i)
-
-		// Format key as string.
-		var k string
-		if isPrintable(string(e.key())) {
-			k = fmt.Sprintf("%q", string(e.key()))
-		} else {
-			k = fmt.Sprintf("%x", string(e.key()))
-		}
-
-		fmt.Fprintf(w, "%s: <pgid=%d>\n", k, e.pgid)
-	}
-	fmt.Fprintf(w, "\n")
-	return nil
-}
-
-// PrintFreelist prints the data for a freelist page.
-func (cmd *PageCommand) PrintFreelist(w io.Writer, buf []byte) error {
-	p := (*page)(unsafe.Pointer(&buf[0]))
-
-	// Check for overflow and, if present, adjust starting index and actual element count.
-	idx, count := 0, int(p.count)
-	if p.count == 0xFFFF {
-		idx = 1
-		count = int(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[0])
-	}
-
-	// Print number of items.
-	fmt.Fprintf(w, "Item Count: %d\n", count)
-	fmt.Fprintf(w, "Overflow: %d\n", p.overflow)
-
-	fmt.Fprintf(w, "\n")
-
-	// Print each page in the freelist.
-	ids := (*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr))
-	for i := idx; i < count; i++ {
-		fmt.Fprintf(w, "%d\n", ids[i])
-	}
-	fmt.Fprintf(w, "\n")
-	return nil
-}
-
-// PrintPage prints a given page as hexadecimal.
-func (cmd *PageCommand) PrintPage(w io.Writer, r io.ReaderAt, pageID int, pageSize int) error {
-	const bytesPerLineN = 16
-
-	// Read page into buffer.
-	buf := make([]byte, pageSize)
-	addr := pageID * pageSize
-	if n, err := r.ReadAt(buf, int64(addr)); err != nil {
-		return err
-	} else if n != pageSize {
-		return io.ErrUnexpectedEOF
-	}
-
-	// Write out to writer in 16-byte lines.
-	var prev []byte
-	var skipped bool
-	for offset := 0; offset < pageSize; offset += bytesPerLineN {
-		// Retrieve current 16-byte line.
-		line := buf[offset : offset+bytesPerLineN]
-		isLastLine := (offset == (pageSize - bytesPerLineN))
-
-		// If it's the same as the previous line then print a skip.
-		if bytes.Equal(line, prev) && !isLastLine {
-			if !skipped {
-				fmt.Fprintf(w, "%07x *\n", addr+offset)
-				skipped = true
-			}
-		} else {
-			// Print line as hexadecimal in 2-byte groups.
-			fmt.Fprintf(w, "%07x %04x %04x %04x %04x %04x %04x %04x %04x\n", addr+offset,
-				line[0:2], line[2:4], line[4:6], line[6:8],
-				line[8:10], line[10:12], line[12:14], line[14:16],
-			)
-
-			skipped = false
-		}
-
-		// Save the previous line.
-		prev = line
-	}
-	fmt.Fprint(w, "\n")
-
-	return nil
-}
-
-// Usage returns the help message.
-func (cmd *PageCommand) Usage() string {
-	return strings.TrimLeft(`
-usage: bolt page PATH pageid [pageid...]
-
-Page prints one or more pages in human readable format.
-`, "\n")
-}
-
-// PagesCommand represents the "pages" command execution.
-type PagesCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
-}
-
-// NewPagesCommand returns a PagesCommand.
-func newPagesCommand(m *Main) *PagesCommand {
-	return &PagesCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
-}
-
-// Run executes the command.
-func (cmd *PagesCommand) Run(args ...string) error {
+func (cmd *pagesCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -871,7 +632,10 @@ func (cmd *PagesCommand) Run(args ...string) error {
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{
+		ReadOnly:        true,
+		PreLoadFreelist: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -914,7 +678,7 @@ func (cmd *PagesCommand) Run(args ...string) error {
 }
 
 // Usage returns the help message.
-func (cmd *PagesCommand) Usage() string {
+func (cmd *pagesCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt pages PATH
 
@@ -928,24 +692,20 @@ a single page to take up multiple blocks.
 `, "\n")
 }
 
-// StatsCommand represents the "stats" command execution.
-type StatsCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// statsCommand represents the "stats" command execution.
+type statsCommand struct {
+	baseCommand
 }
 
-// NewStatsCommand returns a StatsCommand.
-func newStatsCommand(m *Main) *StatsCommand {
-	return &StatsCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newStatsCommand returns a statsCommand.
+func newStatsCommand(m *Main) *statsCommand {
+	c := &statsCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *StatsCommand) Run(args ...string) error {
+func (cmd *statsCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -965,7 +725,7 @@ func (cmd *StatsCommand) Run(args ...string) error {
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return err
 	}
@@ -1028,7 +788,7 @@ func (cmd *StatsCommand) Run(args ...string) error {
 }
 
 // Usage returns the help message.
-func (cmd *StatsCommand) Usage() string {
+func (cmd *statsCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt stats PATH
 
@@ -1063,24 +823,20 @@ experience corruption, please submit a ticket to the Bolt project page:
 `, "\n")
 }
 
-// BucketsCommand represents the "buckets" command execution.
-type BucketsCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// bucketsCommand represents the "buckets" command execution.
+type bucketsCommand struct {
+	baseCommand
 }
 
-// NewBucketsCommand returns a BucketsCommand.
-func newBucketsCommand(m *Main) *BucketsCommand {
-	return &BucketsCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newBucketsCommand returns a bucketsCommand.
+func newBucketsCommand(m *Main) *bucketsCommand {
+	c := &bucketsCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *BucketsCommand) Run(args ...string) error {
+func (cmd *bucketsCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	help := fs.Bool("h", false, "")
@@ -1100,7 +856,7 @@ func (cmd *BucketsCommand) Run(args ...string) error {
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return err
 	}
@@ -1116,7 +872,7 @@ func (cmd *BucketsCommand) Run(args ...string) error {
 }
 
 // Usage returns the help message.
-func (cmd *BucketsCommand) Usage() string {
+func (cmd *bucketsCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt buckets PATH
 
@@ -1124,26 +880,23 @@ Print a list of buckets.
 `, "\n")
 }
 
-// KeysCommand represents the "keys" command execution.
-type KeysCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// keysCommand represents the "keys" command execution.
+type keysCommand struct {
+	baseCommand
 }
 
-// NewKeysCommand returns a KeysCommand.
-func newKeysCommand(m *Main) *KeysCommand {
-	return &KeysCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newKeysCommand returns a keysCommand.
+func newKeysCommand(m *Main) *keysCommand {
+	c := &keysCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *KeysCommand) Run(args ...string) error {
+func (cmd *keysCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
+	optionsFormat := fs.String("format", "bytes", "Output format. One of: "+FORMAT_MODES+" (default: bytes)")
 	help := fs.Bool("h", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1164,7 +917,7 @@ func (cmd *KeysCommand) Run(args ...string) error {
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return err
 	}
@@ -1186,41 +939,49 @@ func (cmd *KeysCommand) Run(args ...string) error {
 
 		// Iterate over each key.
 		return lastbucket.ForEach(func(key, _ []byte) error {
-			fmt.Fprintln(cmd.Stdout, string(key))
-			return nil
+			return writelnBytes(cmd.Stdout, key, *optionsFormat)
 		})
 	})
 }
 
 // Usage returns the help message.
-func (cmd *KeysCommand) Usage() string {
+// TODO: Use https://pkg.go.dev/flag#FlagSet.PrintDefaults to print supported flags.
+func (cmd *keysCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt keys PATH [BUCKET...]
 
 Print a list of keys in the given (sub)bucket.
+=======
+
+Additional options include:
+
+	--format
+		Output format. One of: `+FORMAT_MODES+` (default=bytes)
+
+Print a list of keys in the given bucket.
 `, "\n")
 }
 
-// GetCommand represents the "get" command execution.
-type GetCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// getCommand represents the "get" command execution.
+type getCommand struct {
+	baseCommand
 }
 
-// NewGetCommand returns a GetCommand.
-func newGetCommand(m *Main) *GetCommand {
-	return &GetCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newGetCommand returns a getCommand.
+func newGetCommand(m *Main) *getCommand {
+	c := &getCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *GetCommand) Run(args ...string) error {
+func (cmd *getCommand) Run(args ...string) error {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
+	var parseFormat string
+	var format string
+	fs.StringVar(&parseFormat, "parse-format", "ascii-encoded", "Input format. One of: ascii-encoded|hex (default: ascii-encoded)")
+	fs.StringVar(&format, "format", "bytes", "Output format. One of: "+FORMAT_MODES+" (default: bytes)")
 	help := fs.Bool("h", false, "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1231,19 +992,23 @@ func (cmd *GetCommand) Run(args ...string) error {
 
 	// Require database path, bucket and key.
 	relevantArgs := fs.Args()
-	path, buckets, key := relevantArgs[0], relevantArgs[1:len(relevantArgs)-1], relevantArgs[len(relevantArgs)-1]
+	path, buckets := relevantArgs[0], relevantArgs[1:len(relevantArgs)-1]
+	key, err := parseBytes(relevantArgs[len(relevantArgs)-1], parseFormat)
+	if err != nil {
+		return err
+	}
 	if path == "" {
 		return ErrPathRequired
 	} else if _, err := os.Stat(path); os.IsNotExist(err) {
 		return ErrFileNotFound
 	} else if len(buckets) == 0 {
 		return ErrBucketRequired
-	} else if key == "" {
+	} else if len(key) == 0 {
 		return ErrKeyRequired
 	}
 
 	// Open database.
-	db, err := bolt.Open(path, 0666, nil)
+	db, err := bolt.Open(path, 0666, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return err
 	}
@@ -1264,45 +1029,48 @@ func (cmd *GetCommand) Run(args ...string) error {
 		}
 
 		// Find value for given key.
-		val := lastbucket.Get([]byte(key))
+		val := lastbucket.Get(key)
 		if val == nil {
-			return ErrKeyNotFound
+			return fmt.Errorf("Error %w for key: %q hex: \"%x\"", ErrKeyNotFound, key, string(key))
 		}
 
-		fmt.Fprintln(cmd.Stdout, string(val))
-		return nil
+		// TODO: In this particular case, it would be better to not terminate with '\n'
+		return writelnBytes(cmd.Stdout, val, format)
 	})
 }
 
 // Usage returns the help message.
-func (cmd *GetCommand) Usage() string {
+func (cmd *getCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt get PATH [BUCKET..] KEY
 
 Print the value of the given key in the given (sub)bucket.
+
+Additional options include:
+
+	--format
+		Output format. One of: `+FORMAT_MODES+` (default=bytes)
+	--parse-format
+		Input format (of key). One of: ascii-encoded|hex (default=ascii-encoded)"
 `, "\n")
 }
 
 var benchBucketName = []byte("bench")
 
-// BenchCommand represents the "bench" command execution.
-type BenchCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// benchCommand represents the "bench" command execution.
+type benchCommand struct {
+	baseCommand
 }
 
-// NewBenchCommand returns a BenchCommand using the
-func newBenchCommand(m *Main) *BenchCommand {
-	return &BenchCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+// newBenchCommand returns a BenchCommand using the
+func newBenchCommand(m *Main) *benchCommand {
+	c := &benchCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the "bench" command.
-func (cmd *BenchCommand) Run(args ...string) error {
+func (cmd *benchCommand) Run(args ...string) error {
 	// Parse CLI arguments.
 	options, err := cmd.ParseFlags(args)
 	if err != nil {
@@ -1343,7 +1111,7 @@ func (cmd *BenchCommand) Run(args ...string) error {
 }
 
 // ParseFlags parses the command line flags.
-func (cmd *BenchCommand) ParseFlags(args []string) (*BenchOptions, error) {
+func (cmd *benchCommand) ParseFlags(args []string) (*BenchOptions, error) {
 	var options BenchOptions
 
 	// Parse flagset.
@@ -1390,7 +1158,7 @@ func (cmd *BenchCommand) ParseFlags(args []string) (*BenchOptions, error) {
 }
 
 // Writes to the database.
-func (cmd *BenchCommand) runWrites(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runWrites(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	// Start profiling for writes.
 	if options.ProfileMode == "rw" || options.ProfileMode == "w" {
 		cmd.startProfiling(options)
@@ -1423,27 +1191,27 @@ func (cmd *BenchCommand) runWrites(db *bolt.DB, options *BenchOptions, results *
 	return err
 }
 
-func (cmd *BenchCommand) runWritesSequential(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runWritesSequential(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	var i = uint32(0)
 	return cmd.runWritesWithSource(db, options, results, func() uint32 { i++; return i })
 }
 
-func (cmd *BenchCommand) runWritesRandom(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runWritesRandom(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return cmd.runWritesWithSource(db, options, results, func() uint32 { return r.Uint32() })
 }
 
-func (cmd *BenchCommand) runWritesSequentialNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runWritesSequentialNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	var i = uint32(0)
 	return cmd.runWritesNestedWithSource(db, options, results, func() uint32 { i++; return i })
 }
 
-func (cmd *BenchCommand) runWritesRandomNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runWritesRandomNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return cmd.runWritesNestedWithSource(db, options, results, func() uint32 { return r.Uint32() })
 }
 
-func (cmd *BenchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
+func (cmd *benchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
 	results.WriteOps = options.Iterations
 
 	for i := 0; i < options.Iterations; i += options.BatchSize {
@@ -1472,7 +1240,7 @@ func (cmd *BenchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions,
 	return nil
 }
 
-func (cmd *BenchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
+func (cmd *benchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
 	results.WriteOps = options.Iterations
 
 	for i := 0; i < options.Iterations; i += options.BatchSize {
@@ -1516,7 +1284,7 @@ func (cmd *BenchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOp
 }
 
 // Reads from the database.
-func (cmd *BenchCommand) runReads(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runReads(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	// Start profiling for reads.
 	if options.ProfileMode == "r" {
 		cmd.startProfiling(options)
@@ -1548,7 +1316,7 @@ func (cmd *BenchCommand) runReads(db *bolt.DB, options *BenchOptions, results *B
 	return err
 }
 
-func (cmd *BenchCommand) runReadsSequential(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runReadsSequential(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	return db.View(func(tx *bolt.Tx) error {
 		t := time.Now()
 
@@ -1579,7 +1347,7 @@ func (cmd *BenchCommand) runReadsSequential(db *bolt.DB, options *BenchOptions, 
 	})
 }
 
-func (cmd *BenchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+func (cmd *benchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
 	return db.View(func(tx *bolt.Tx) error {
 		t := time.Now()
 
@@ -1621,7 +1389,7 @@ func (cmd *BenchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOpt
 var cpuprofile, memprofile, blockprofile *os.File
 
 // Starts all profiles set on the options.
-func (cmd *BenchCommand) startProfiling(options *BenchOptions) {
+func (cmd *benchCommand) startProfiling(options *BenchOptions) {
 	var err error
 
 	// Start CPU profiling.
@@ -1660,7 +1428,7 @@ func (cmd *BenchCommand) startProfiling(options *BenchOptions) {
 }
 
 // Stops all profiles.
-func (cmd *BenchCommand) stopProfiling() {
+func (cmd *benchCommand) stopProfiling() {
 	if cpuprofile != nil {
 		pprof.StopCPUProfile()
 		cpuprofile.Close()
@@ -1770,72 +1538,24 @@ func isPrintable(s string) bool {
 	return true
 }
 
-// ReadPage reads page info & full page data from a path.
-// This is not transactionally safe.
-func ReadPage(path string, pageID int) (*page, []byte, error) {
-	// Find page size.
-	pageSize, err := ReadPageSize(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read page size: %s", err)
+func bytesToAsciiOrHex(b []byte) string {
+	sb := string(b)
+	if isPrintable(sb) {
+		return sb
+	} else {
+		return hex.EncodeToString(b)
 	}
-
-	// Open database file.
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer f.Close()
-
-	// Read one block into buffer.
-	buf := make([]byte, pageSize)
-	if n, err := f.ReadAt(buf, int64(pageID*pageSize)); err != nil {
-		return nil, nil, err
-	} else if n != len(buf) {
-		return nil, nil, io.ErrUnexpectedEOF
-	}
-
-	// Determine total number of blocks.
-	p := (*page)(unsafe.Pointer(&buf[0]))
-	overflowN := p.overflow
-
-	// Re-read entire page (with overflow) into buffer.
-	buf = make([]byte, (int(overflowN)+1)*pageSize)
-	if n, err := f.ReadAt(buf, int64(pageID*pageSize)); err != nil {
-		return nil, nil, err
-	} else if n != len(buf) {
-		return nil, nil, io.ErrUnexpectedEOF
-	}
-	p = (*page)(unsafe.Pointer(&buf[0]))
-
-	return p, buf, nil
 }
 
-// ReadPageSize reads page size a path.
-// This is not transactionally safe.
-func ReadPageSize(path string) (int, error) {
-	// Open database file.
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	// Read 4KB chunk.
-	buf := make([]byte, 4096)
-	if _, err := io.ReadFull(f, buf); err != nil {
-		return 0, err
-	}
-
-	// Read page size from metadata.
-	m := (*meta)(unsafe.Pointer(&buf[PageHeaderSize]))
-	return int(m.pageSize), nil
+func stringToPage(str string) (uint64, error) {
+	return strconv.ParseUint(str, 10, 64)
 }
 
-// atois parses a slice of strings into integers.
-func atois(strs []string) ([]int, error) {
-	var a []int
+// stringToPages parses a slice of strings into page ids.
+func stringToPages(strs []string) ([]uint64, error) {
+	var a []uint64
 	for _, str := range strs {
-		i, err := strconv.Atoi(str)
+		i, err := stringToPage(str)
 		if err != nil {
 			return nil, err
 		}
@@ -1844,117 +1564,9 @@ func atois(strs []string) ([]int, error) {
 	return a, nil
 }
 
-// DO NOT EDIT. Copied from the "bolt" package.
-const maxAllocSize = 0xFFFFFFF
-
-// DO NOT EDIT. Copied from the "bolt" package.
-const (
-	branchPageFlag   = 0x01
-	leafPageFlag     = 0x02
-	metaPageFlag     = 0x04
-	freelistPageFlag = 0x10
-)
-
-// DO NOT EDIT. Copied from the "bolt" package.
-const bucketLeafFlag = 0x01
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type pgid uint64
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type txid uint64
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type meta struct {
-	magic    uint32
-	version  uint32
-	pageSize uint32
-	flags    uint32
-	root     bucket
-	freelist pgid
-	pgid     pgid
-	txid     txid
-	checksum uint64
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type bucket struct {
-	root     pgid
-	sequence uint64
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type page struct {
-	id       pgid
-	flags    uint16
-	count    uint16
-	overflow uint32
-	ptr      uintptr
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (p *page) Type() string {
-	if (p.flags & branchPageFlag) != 0 {
-		return "branch"
-	} else if (p.flags & leafPageFlag) != 0 {
-		return "leaf"
-	} else if (p.flags & metaPageFlag) != 0 {
-		return "meta"
-	} else if (p.flags & freelistPageFlag) != 0 {
-		return "freelist"
-	}
-	return fmt.Sprintf("unknown<%02x>", p.flags)
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (p *page) leafPageElement(index uint16) *leafPageElement {
-	n := &((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[index]
-	return n
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (p *page) branchPageElement(index uint16) *branchPageElement {
-	return &((*[0x7FFFFFF]branchPageElement)(unsafe.Pointer(&p.ptr)))[index]
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type branchPageElement struct {
-	pos   uint32
-	ksize uint32
-	pgid  pgid
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (n *branchPageElement) key() []byte {
-	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
-	return buf[n.pos : n.pos+n.ksize]
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-type leafPageElement struct {
-	flags uint32
-	pos   uint32
-	ksize uint32
-	vsize uint32
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (n *leafPageElement) key() []byte {
-	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
-	return buf[n.pos : n.pos+n.ksize]
-}
-
-// DO NOT EDIT. Copied from the "bolt" package.
-func (n *leafPageElement) value() []byte {
-	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
-	return buf[n.pos+n.ksize : n.pos+n.ksize+n.vsize]
-}
-
-// CompactCommand represents the "compact" command execution.
-type CompactCommand struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+// compactCommand represents the "compact" command execution.
+type compactCommand struct {
+	baseCommand
 
 	SrcPath   string
 	DstPath   string
@@ -1962,16 +1574,14 @@ type CompactCommand struct {
 }
 
 // newCompactCommand returns a CompactCommand.
-func newCompactCommand(m *Main) *CompactCommand {
-	return &CompactCommand{
-		Stdin:  m.Stdin,
-		Stdout: m.Stdout,
-		Stderr: m.Stderr,
-	}
+func newCompactCommand(m *Main) *compactCommand {
+	c := &compactCommand{}
+	c.baseCommand = m.baseCommand
+	return c
 }
 
 // Run executes the command.
-func (cmd *CompactCommand) Run(args ...string) (err error) {
+func (cmd *compactCommand) Run(args ...string) (err error) {
 	// Parse flags.
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -2033,7 +1643,7 @@ func (cmd *CompactCommand) Run(args ...string) (err error) {
 }
 
 // Usage returns the help message.
-func (cmd *CompactCommand) Usage() string {
+func (cmd *compactCommand) Usage() string {
 	return strings.TrimLeft(`
 usage: bolt compact [options] -o DST SRC
 
@@ -2048,4 +1658,18 @@ Additional options include:
 		Specifies the maximum size of individual transactions.
 		Defaults to 64KB.
 `, "\n")
+}
+
+type cmdKvStringer struct{}
+
+func (_ cmdKvStringer) KeyToString(key []byte) string {
+	return bytesToAsciiOrHex(key)
+}
+
+func (_ cmdKvStringer) ValueToString(value []byte) string {
+	return bytesToAsciiOrHex(value)
+}
+
+func CmdKvStringer() bolt.KVStringer {
+	return cmdKvStringer{}
 }

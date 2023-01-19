@@ -2,24 +2,62 @@ BRANCH=`git rev-parse --abbrev-ref HEAD`
 COMMIT=`git rev-parse --short HEAD`
 GOLDFLAGS="-X main.branch $(BRANCH) -X main.commit $(COMMIT)"
 
-race:
-	@TEST_FREELIST_TYPE=hashmap go test -v -race -test.run="TestSimulate_(100op|1000op)"
-	@echo "array freelist test"
-	@TEST_FREELIST_TYPE=array go test -v -race -test.run="TestSimulate_(100op|1000op)"
+TESTFLAGS_RACE=-race=false
+ifdef ENABLE_RACE
+	TESTFLAGS_RACE=-race=true
+endif
 
+TESTFLAGS_CPU=
+ifdef CPU
+	TESTFLAGS_CPU=-cpu=$(CPU)
+endif
+TESTFLAGS = $(TESTFLAGS_RACE) $(TESTFLAGS_CPU) $(EXTRA_TESTFLAGS)
+
+.PHONY: fmt
 fmt:
 	!(gofmt -l -s -d $(shell find . -name \*.go) | grep '[a-z]')
 
+.PHONY: lint
 lint:
 	golangci-lint run ./...
 
+.PHONY: test
 test:
-	TEST_FREELIST_TYPE=hashmap go test -timeout 20m -v -coverprofile cover.out -covermode atomic
-	TEST_FREELIST_TYPE=hashmap go test -v ./cmd/bbolt
+	@echo "hashmap freelist test"
+	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout 30m
+	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} ./cmd/bbolt
 
 	@echo "array freelist test"
+	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout 30m
+	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} ./cmd/bbolt
 
-	@TEST_FREELIST_TYPE=array go test -timeout 20m -v -coverprofile cover.out -covermode atomic
-	@TEST_FREELIST_TYPE=array go test -v ./cmd/bbolt
+.PHONY: coverage
+coverage:
+	@echo "hashmap freelist test"
+	TEST_FREELIST_TYPE=hashmap go test -v -timeout 30m \
+		-coverprofile cover-freelist-hashmap.out -covermode atomic
 
-.PHONY: race fmt test lint
+	@echo "array freelist test"
+	TEST_FREELIST_TYPE=array go test -v -timeout 30m \
+		-coverprofile cover-freelist-array.out -covermode atomic
+
+.PHONY: gofail-enable
+gofail-enable: install-gofail
+	gofail enable .
+
+.PHONY: gofail-disable
+gofail-disable:
+	gofail disable .
+
+.PHONY: install-gofail
+install-gofail:
+	go install go.etcd.io/gofail
+
+.PHONY: test-failpoint
+test-failpoint:
+	@echo "[failpoint] hashmap freelist test"
+	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
+
+	@echo "[failpoint] array freelist test"
+	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
+
