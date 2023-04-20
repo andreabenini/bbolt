@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	bolt "go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 	"go.etcd.io/bbolt/internal/btesting"
 )
 
@@ -136,7 +137,7 @@ func TestOpen_ErrInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrInvalid {
+	if _, err := bolt.Open(path, 0666, nil); err != berrors.ErrInvalid {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -172,7 +173,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	}
 
 	// Reopen data file.
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrVersionMismatch {
+	if _, err := bolt.Open(path, 0666, nil); err != berrors.ErrVersionMismatch {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -208,7 +209,7 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	}
 
 	// Reopen data file.
-	if _, err := bolt.Open(path, 0666, nil); err != bolt.ErrChecksum {
+	if _, err := bolt.Open(path, 0666, nil); err != berrors.ErrChecksum {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -398,7 +399,7 @@ func TestOpen_Check(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = db.View(func(tx *bolt.Tx) error { return <-tx.Check(bolt.HexKVStringer()) }); err != nil {
+	if err = db.View(func(tx *bolt.Tx) error { return <-tx.Check() }); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.Close(); err != nil {
@@ -409,7 +410,7 @@ func TestOpen_Check(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.View(func(tx *bolt.Tx) error { return <-tx.Check(bolt.HexKVStringer()) }); err != nil {
+	if err := db.View(func(tx *bolt.Tx) error { return <-tx.Check() }); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -552,7 +553,7 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	}
 
 	// Can't launch read-write transaction.
-	if _, err := readOnlyDB.Begin(true); err != bolt.ErrDatabaseReadOnly {
+	if _, err := readOnlyDB.Begin(true); err != berrors.ErrDatabaseReadOnly {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
@@ -641,7 +642,7 @@ func TestOpen_RecoverFreeList(t *testing.T) {
 // Ensure that a database cannot open a transaction when it's not open.
 func TestDB_Begin_ErrDatabaseNotOpen(t *testing.T) {
 	var db bolt.DB
-	if _, err := db.Begin(false); err != bolt.ErrDatabaseNotOpen {
+	if _, err := db.Begin(false); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -727,7 +728,7 @@ func TestDB_Concurrent_WriteTo(t *testing.T) {
 // Ensure that opening a transaction while the DB is closed returns an error.
 func TestDB_BeginRW_Closed(t *testing.T) {
 	var db bolt.DB
-	if _, err := db.Begin(true); err != bolt.ErrDatabaseNotOpen {
+	if _, err := db.Begin(true); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -746,11 +747,15 @@ func testDB_Close_PendingTx(t *testing.T, writable bool) {
 	}
 
 	// Open update in separate goroutine.
+	startCh := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
+		startCh <- struct{}{}
 		err := db.Close()
 		done <- err
 	}()
+	// wait for the above goroutine to get scheduled.
+	<-startCh
 
 	// Ensure database hasn't closed.
 	time.Sleep(100 * time.Millisecond)
@@ -774,14 +779,13 @@ func testDB_Close_PendingTx(t *testing.T, writable bool) {
 	}
 
 	// Ensure database closed now.
-	time.Sleep(100 * time.Millisecond)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("error from inside goroutine: %v", err)
 		}
-	default:
-		t.Fatal("database did not close")
+	case <-time.After(5 * time.Second):
+		t.Fatalf("database did not close")
 	}
 }
 
@@ -828,7 +832,7 @@ func TestDB_Update_Closed(t *testing.T) {
 			t.Fatal(err)
 		}
 		return nil
-	}); err != bolt.ErrDatabaseNotOpen {
+	}); err != berrors.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }

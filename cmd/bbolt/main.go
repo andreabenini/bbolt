@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -14,14 +15,15 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
-	"unsafe"
-
-	"go.etcd.io/bbolt/internal/guts_cli"
 
 	bolt "go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
+	"go.etcd.io/bbolt/internal/common"
+	"go.etcd.io/bbolt/internal/guts_cli"
 )
 
 var (
@@ -51,12 +53,6 @@ var (
 	// ErrBucketRequired is returned when a bucket is not specified.
 	ErrBucketRequired = errors.New("bucket required")
 
-	// ErrBucketNotFound is returned when a bucket is not found.
-	ErrBucketNotFound = errors.New("bucket not found")
-
-	// ErrKeyRequired is returned when a key is not specified.
-	ErrKeyRequired = errors.New("key required")
-
 	// ErrKeyNotFound is returned when a key is not found.
 	ErrKeyNotFound = errors.New("key not found")
 )
@@ -65,9 +61,23 @@ func main() {
 	m := NewMain()
 	if err := m.Run(os.Args[1:]...); err == ErrUsage {
 		os.Exit(2)
+	} else if err == ErrUnknownCommand {
+		cobraExecute()
 	} else if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
+	}
+}
+
+func cobraExecute() {
+	rootCmd := NewRootCommand()
+	if err := rootCmd.Execute(); err != nil {
+		if rootCmd.SilenceErrors {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		} else {
+			os.Exit(1)
+		}
 	}
 }
 
@@ -212,7 +222,7 @@ func (cmd *checkCommand) Run(args ...string) error {
 	// Perform consistency check.
 	return db.View(func(tx *bolt.Tx) error {
 		var count int
-		for err := range tx.Check(CmdKvStringer()) {
+		for err := range tx.Check(bolt.WithKVStringer(CmdKvStringer())) {
 			fmt.Fprintln(cmd.Stdout, err)
 			count++
 		}
@@ -508,16 +518,17 @@ func (cmd *pageItemCommand) Run(args ...string) error {
 	return nil
 }
 
-// leafPageElement retrieves a leaf page element.
-func (cmd *pageItemCommand) leafPageElement(pageBytes []byte, index uint16) (*guts_cli.LeafPageElement, error) {
-	p := (*guts_cli.Page)(unsafe.Pointer(&pageBytes[0]))
+func (cmd *pageItemCommand) leafPageElement(pageBytes []byte, index uint16) ([]byte, []byte, error) {
+	p := common.LoadPage(pageBytes)
 	if index >= p.Count() {
-		return nil, fmt.Errorf("leafPageElement: expected item index less than %d, but got %d.", p.Count(), index)
+		return nil, nil, fmt.Errorf("leafPageElement: expected item index less than %d, but got %d", p.Count(), index)
 	}
-	if p.Type() != "leaf" {
-		return nil, fmt.Errorf("leafPageElement: expected page type of 'leaf', but got '%s'", p.Type())
+	if p.Typ() != "leaf" {
+		return nil, nil, fmt.Errorf("leafPageElement: expected page type of 'leaf', but got '%s'", p.Typ())
 	}
-	return p.LeafPageElement(index), nil
+
+	e := p.LeafPageElement(index)
+	return e.Key(), e.Value(), nil
 }
 
 const FORMAT_MODES = "auto|ascii-encoded|hex|bytes|redacted"
@@ -535,7 +546,9 @@ func formatBytes(b []byte, format string) (string, error) {
 	case "auto":
 		return bytesToAsciiOrHex(b), nil
 	case "redacted":
-		return fmt.Sprintf("<redacted len:%d>", len(b)), nil
+		hash := sha256.New()
+		hash.Write(b)
+		return fmt.Sprintf("<redacted len:%d sha256:%x>", len(b), hash.Sum(nil)), nil
 	default:
 		return "", fmt.Errorf("formatBytes: unsupported format: %s", format)
 	}
@@ -565,20 +578,21 @@ func writelnBytes(w io.Writer, b []byte, format string) error {
 
 // PrintLeafItemKey writes the bytes of a leaf element's key.
 func (cmd *pageItemCommand) PrintLeafItemKey(w io.Writer, pageBytes []byte, index uint16, format string) error {
-	e, err := cmd.leafPageElement(pageBytes, index)
+	k, _, err := cmd.leafPageElement(pageBytes, index)
 	if err != nil {
 		return err
 	}
-	return writelnBytes(w, e.Key(), format)
+
+	return writelnBytes(w, k, format)
 }
 
-// PrintLeafItemKey writes the bytes of a leaf element's value.
+// PrintLeafItemValue writes the bytes of a leaf element's value.
 func (cmd *pageItemCommand) PrintLeafItemValue(w io.Writer, pageBytes []byte, index uint16, format string) error {
-	e, err := cmd.leafPageElement(pageBytes, index)
+	_, v, err := cmd.leafPageElement(pageBytes, index)
 	if err != nil {
 		return err
 	}
-	return writelnBytes(w, e.Value(), format)
+	return writelnBytes(w, v, format)
 }
 
 // Usage returns the help message.
@@ -928,12 +942,12 @@ func (cmd *keysCommand) Run(args ...string) error {
 		// Find bucket.
 		var lastbucket *bolt.Bucket = tx.Bucket([]byte(buckets[0]))
 		if lastbucket == nil {
-			return ErrBucketNotFound
+			return berrors.ErrBucketNotFound
 		}
 		for _, bucket := range buckets[1:] {
 			lastbucket = lastbucket.Bucket([]byte(bucket))
 			if lastbucket == nil {
-				return ErrBucketNotFound
+				return berrors.ErrBucketNotFound
 			}
 		}
 
@@ -1004,7 +1018,7 @@ func (cmd *getCommand) Run(args ...string) error {
 	} else if len(buckets) == 0 {
 		return ErrBucketRequired
 	} else if len(key) == 0 {
-		return ErrKeyRequired
+		return berrors.ErrKeyRequired
 	}
 
 	// Open database.
@@ -1019,12 +1033,12 @@ func (cmd *getCommand) Run(args ...string) error {
 		// Find bucket.
 		var lastbucket *bolt.Bucket = tx.Bucket([]byte(buckets[0]))
 		if lastbucket == nil {
-			return ErrBucketNotFound
+			return berrors.ErrBucketNotFound
 		}
 		for _, bucket := range buckets[1:] {
 			lastbucket = lastbucket.Bucket([]byte(bucket))
 			if lastbucket == nil {
-				return ErrBucketNotFound
+				return berrors.ErrBucketNotFound
 			}
 		}
 
@@ -1079,7 +1093,7 @@ func (cmd *benchCommand) Run(args ...string) error {
 
 	// Remove path if "-work" is not set. Otherwise keep path.
 	if options.Work {
-		fmt.Fprintf(cmd.Stdout, "work: %s\n", options.Path)
+		fmt.Fprintf(cmd.Stderr, "work: %s\n", options.Path)
 	} else {
 		defer os.Remove(options.Path)
 	}
@@ -1093,20 +1107,23 @@ func (cmd *benchCommand) Run(args ...string) error {
 	defer db.Close()
 
 	// Write to the database.
-	var results BenchResults
-	if err := cmd.runWrites(db, options, &results); err != nil {
+	var writeResults BenchResults
+	fmt.Fprintf(cmd.Stderr, "starting write benchmark.\n")
+	if err := cmd.runWrites(db, options, &writeResults); err != nil {
 		return fmt.Errorf("write: %v", err)
 	}
 
+	var readResults BenchResults
+	fmt.Fprintf(cmd.Stderr, "starting read benchmark.\n")
 	// Read from the database.
-	if err := cmd.runReads(db, options, &results); err != nil {
+	if err := cmd.runReads(db, options, &readResults); err != nil {
 		return fmt.Errorf("bench: read: %s", err)
 	}
 
 	// Print results.
-	fmt.Fprintf(os.Stderr, "# Write\t%v\t(%v/op)\t(%v op/sec)\n", results.WriteDuration, results.WriteOpDuration(), results.WriteOpsPerSecond())
-	fmt.Fprintf(os.Stderr, "# Read\t%v\t(%v/op)\t(%v op/sec)\n", results.ReadDuration, results.ReadOpDuration(), results.ReadOpsPerSecond())
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintf(cmd.Stderr, "# Write\t%v(ops)\t%v\t(%v/op)\t(%v op/sec)\n", writeResults.CompletedOps(), writeResults.Duration(), writeResults.OpDuration(), writeResults.OpsPerSecond())
+	fmt.Fprintf(cmd.Stderr, "# Read\t%v(ops)\t%v\t(%v/op)\t(%v op/sec)\n", readResults.CompletedOps(), readResults.Duration(), readResults.OpDuration(), readResults.OpsPerSecond())
+	fmt.Fprintln(cmd.Stderr, "")
 	return nil
 }
 
@@ -1119,8 +1136,8 @@ func (cmd *benchCommand) ParseFlags(args []string) (*BenchOptions, error) {
 	fs.StringVar(&options.ProfileMode, "profile-mode", "rw", "")
 	fs.StringVar(&options.WriteMode, "write-mode", "seq", "")
 	fs.StringVar(&options.ReadMode, "read-mode", "seq", "")
-	fs.IntVar(&options.Iterations, "count", 1000, "")
-	fs.IntVar(&options.BatchSize, "batch-size", 0, "")
+	fs.Int64Var(&options.Iterations, "count", 1000, "")
+	fs.Int64Var(&options.BatchSize, "batch-size", 0, "")
 	fs.IntVar(&options.KeySize, "key-size", 8, "")
 	fs.IntVar(&options.ValueSize, "value-size", 32, "")
 	fs.StringVar(&options.CPUProfile, "cpuprofile", "", "")
@@ -1164,6 +1181,10 @@ func (cmd *benchCommand) runWrites(db *bolt.DB, options *BenchOptions, results *
 		cmd.startProfiling(options)
 	}
 
+	finishChan := make(chan interface{})
+	go checkProgress(results, finishChan, cmd.Stderr)
+	defer close(finishChan)
+
 	t := time.Now()
 
 	var err error
@@ -1181,7 +1202,7 @@ func (cmd *benchCommand) runWrites(db *bolt.DB, options *BenchOptions, results *
 	}
 
 	// Save time to write.
-	results.WriteDuration = time.Since(t)
+	results.SetDuration(time.Since(t))
 
 	// Stop profiling for writes only.
 	if options.ProfileMode == "w" {
@@ -1212,14 +1233,13 @@ func (cmd *benchCommand) runWritesRandomNested(db *bolt.DB, options *BenchOption
 }
 
 func (cmd *benchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
-	results.WriteOps = options.Iterations
-
-	for i := 0; i < options.Iterations; i += options.BatchSize {
+	for i := int64(0); i < options.Iterations; i += options.BatchSize {
 		if err := db.Update(func(tx *bolt.Tx) error {
 			b, _ := tx.CreateBucketIfNotExists(benchBucketName)
 			b.FillPercent = options.FillPercent
 
-			for j := 0; j < options.BatchSize; j++ {
+			fmt.Fprintf(cmd.Stderr, "Starting write iteration %d\n", i)
+			for j := int64(0); j < options.BatchSize; j++ {
 				key := make([]byte, options.KeySize)
 				value := make([]byte, options.ValueSize)
 
@@ -1230,7 +1250,10 @@ func (cmd *benchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions,
 				if err := b.Put(key, value); err != nil {
 					return err
 				}
+
+				results.AddCompletedOps(1)
 			}
+			fmt.Fprintf(cmd.Stderr, "Finished write iteration %d\n", i)
 
 			return nil
 		}); err != nil {
@@ -1241,9 +1264,7 @@ func (cmd *benchCommand) runWritesWithSource(db *bolt.DB, options *BenchOptions,
 }
 
 func (cmd *benchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
-	results.WriteOps = options.Iterations
-
-	for i := 0; i < options.Iterations; i += options.BatchSize {
+	for i := int64(0); i < options.Iterations; i += options.BatchSize {
 		if err := db.Update(func(tx *bolt.Tx) error {
 			top, err := tx.CreateBucketIfNotExists(benchBucketName)
 			if err != nil {
@@ -1262,7 +1283,8 @@ func (cmd *benchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOp
 			}
 			b.FillPercent = options.FillPercent
 
-			for j := 0; j < options.BatchSize; j++ {
+			fmt.Fprintf(cmd.Stderr, "Starting write iteration %d\n", i)
+			for j := int64(0); j < options.BatchSize; j++ {
 				var key = make([]byte, options.KeySize)
 				var value = make([]byte, options.ValueSize)
 
@@ -1273,7 +1295,10 @@ func (cmd *benchCommand) runWritesNestedWithSource(db *bolt.DB, options *BenchOp
 				if err := b.Put(key, value); err != nil {
 					return err
 				}
+
+				results.AddCompletedOps(1)
 			}
+			fmt.Fprintf(cmd.Stderr, "Finished write iteration %d\n", i)
 
 			return nil
 		}); err != nil {
@@ -1289,6 +1314,10 @@ func (cmd *benchCommand) runReads(db *bolt.DB, options *BenchOptions, results *B
 	if options.ProfileMode == "r" {
 		cmd.startProfiling(options)
 	}
+
+	finishChan := make(chan interface{})
+	go checkProgress(results, finishChan, cmd.Stderr)
+	defer close(finishChan)
 
 	t := time.Now()
 
@@ -1306,7 +1335,7 @@ func (cmd *benchCommand) runReads(db *bolt.DB, options *BenchOptions, results *B
 	}
 
 	// Save read time.
-	results.ReadDuration = time.Since(t)
+	results.SetDuration(time.Since(t))
 
 	// Stop profiling for reads.
 	if options.ProfileMode == "rw" || options.ProfileMode == "r" {
@@ -1321,21 +1350,19 @@ func (cmd *benchCommand) runReadsSequential(db *bolt.DB, options *BenchOptions, 
 		t := time.Now()
 
 		for {
-			var count int
-
+			numReads := int64(0)
 			c := tx.Bucket(benchBucketName).Cursor()
 			for k, v := c.First(); k != nil; k, v = c.Next() {
+				numReads++
+				results.AddCompletedOps(1)
 				if v == nil {
 					return errors.New("invalid value")
 				}
-				count++
 			}
 
-			if options.WriteMode == "seq" && count != options.Iterations {
-				return fmt.Errorf("read seq: iter mismatch: expected %d, got %d", options.Iterations, count)
+			if options.WriteMode == "seq" && numReads != options.Iterations {
+				return fmt.Errorf("read seq: iter mismatch: expected %d, got %d", options.Iterations, numReads)
 			}
-
-			results.ReadOps += count
 
 			// Make sure we do this for at least a second.
 			if time.Since(t) >= time.Second {
@@ -1352,16 +1379,17 @@ func (cmd *benchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOpt
 		t := time.Now()
 
 		for {
-			var count int
+			numReads := int64(0)
 			var top = tx.Bucket(benchBucketName)
 			if err := top.ForEach(func(name, _ []byte) error {
 				if b := top.Bucket(name); b != nil {
 					c := b.Cursor()
 					for k, v := c.First(); k != nil; k, v = c.Next() {
+						numReads++
+						results.AddCompletedOps(1)
 						if v == nil {
 							return ErrInvalidValue
 						}
-						count++
 					}
 				}
 				return nil
@@ -1369,11 +1397,9 @@ func (cmd *benchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOpt
 				return err
 			}
 
-			if options.WriteMode == "seq-nest" && count != options.Iterations {
-				return fmt.Errorf("read seq-nest: iter mismatch: expected %d, got %d", options.Iterations, count)
+			if options.WriteMode == "seq-nest" && numReads != options.Iterations {
+				return fmt.Errorf("read seq-nest: iter mismatch: expected %d, got %d", options.Iterations, numReads)
 			}
-
-			results.ReadOps += count
 
 			// Make sure we do this for at least a second.
 			if time.Since(t) >= time.Second {
@@ -1383,6 +1409,23 @@ func (cmd *benchCommand) runReadsSequentialNested(db *bolt.DB, options *BenchOpt
 
 		return nil
 	})
+}
+
+func checkProgress(results *BenchResults, finishChan chan interface{}, stderr io.Writer) {
+	ticker := time.Tick(time.Second)
+	lastCompleted, lastTime := int64(0), time.Now()
+	for {
+		select {
+		case <-finishChan:
+			return
+		case t := <-ticker:
+			completed, taken := results.CompletedOps(), t.Sub(lastTime)
+			fmt.Fprintf(stderr, "Completed %d requests, %d/s \n",
+				completed, ((completed-lastCompleted)*int64(time.Second))/int64(taken),
+			)
+			lastCompleted, lastTime = completed, t
+		}
+	}
 }
 
 // File handlers for the various profiles.
@@ -1460,8 +1503,8 @@ type BenchOptions struct {
 	ProfileMode   string
 	WriteMode     string
 	ReadMode      string
-	Iterations    int
-	BatchSize     int
+	Iterations    int64
+	BatchSize     int64
 	KeySize       int
 	ValueSize     int
 	CPUProfile    string
@@ -1474,42 +1517,39 @@ type BenchOptions struct {
 	Path          string
 }
 
-// BenchResults represents the performance results of the benchmark.
+// BenchResults represents the performance results of the benchmark and is thread-safe.
 type BenchResults struct {
-	WriteOps      int
-	WriteDuration time.Duration
-	ReadOps       int
-	ReadDuration  time.Duration
+	completedOps int64
+	duration     int64
 }
 
-// Returns the duration for a single write operation.
-func (r *BenchResults) WriteOpDuration() time.Duration {
-	if r.WriteOps == 0 {
+func (r *BenchResults) AddCompletedOps(amount int64) {
+	atomic.AddInt64(&r.completedOps, amount)
+}
+
+func (r *BenchResults) CompletedOps() int64 {
+	return atomic.LoadInt64(&r.completedOps)
+}
+
+func (r *BenchResults) SetDuration(dur time.Duration) {
+	atomic.StoreInt64(&r.duration, int64(dur))
+}
+
+func (r *BenchResults) Duration() time.Duration {
+	return time.Duration(atomic.LoadInt64(&r.duration))
+}
+
+// Returns the duration for a single read/write operation.
+func (r *BenchResults) OpDuration() time.Duration {
+	if r.CompletedOps() == 0 {
 		return 0
 	}
-	return r.WriteDuration / time.Duration(r.WriteOps)
+	return r.Duration() / time.Duration(r.CompletedOps())
 }
 
-// Returns average number of write operations that can be performed per second.
-func (r *BenchResults) WriteOpsPerSecond() int {
-	var op = r.WriteOpDuration()
-	if op == 0 {
-		return 0
-	}
-	return int(time.Second) / int(op)
-}
-
-// Returns the duration for a single read operation.
-func (r *BenchResults) ReadOpDuration() time.Duration {
-	if r.ReadOps == 0 {
-		return 0
-	}
-	return r.ReadDuration / time.Duration(r.ReadOps)
-}
-
-// Returns average number of read operations that can be performed per second.
-func (r *BenchResults) ReadOpsPerSecond() int {
-	var op = r.ReadOpDuration()
+// Returns average number of read/write operations that can be performed per second.
+func (r *BenchResults) OpsPerSecond() int {
+	var op = r.OpDuration()
 	if op == 0 {
 		return 0
 	}
@@ -1571,6 +1611,7 @@ type compactCommand struct {
 	SrcPath   string
 	DstPath   string
 	TxMaxSize int64
+	DstNoSync bool
 }
 
 // newCompactCommand returns a CompactCommand.
@@ -1587,6 +1628,7 @@ func (cmd *compactCommand) Run(args ...string) (err error) {
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cmd.DstPath, "o", "", "")
 	fs.Int64Var(&cmd.TxMaxSize, "tx-max-size", 65536, "")
+	fs.BoolVar(&cmd.DstNoSync, "no-sync", false, "")
 	if err := fs.Parse(args); err == flag.ErrHelp {
 		fmt.Fprintln(cmd.Stderr, cmd.Usage())
 		return ErrUsage
@@ -1619,7 +1661,7 @@ func (cmd *compactCommand) Run(args ...string) (err error) {
 	defer src.Close()
 
 	// Open destination database.
-	dst, err := bolt.Open(cmd.DstPath, fi.Mode(), nil)
+	dst, err := bolt.Open(cmd.DstPath, fi.Mode(), &bolt.Options{NoSync: cmd.DstNoSync})
 	if err != nil {
 		return err
 	}
@@ -1657,6 +1699,10 @@ Additional options include:
 	-tx-max-size NUM
 		Specifies the maximum size of individual transactions.
 		Defaults to 64KB.
+
+	-no-sync BOOL
+		Skip fsync() calls after each commit (fast but unsafe)
+		Defaults to false
 `, "\n")
 }
 

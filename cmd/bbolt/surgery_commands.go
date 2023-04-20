@@ -4,12 +4,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
 
-	"go.etcd.io/bbolt/internal/guts_cli"
+	"go.etcd.io/bbolt/internal/common"
 	"go.etcd.io/bbolt/internal/surgeon"
 )
 
@@ -45,6 +44,8 @@ func (cmd *surgeryCommand) Run(args ...string) error {
 		return newRevertMetaPageCommand(cmd).Run(args[1:]...)
 	case "copy-page":
 		return newCopyPageCommand(cmd).Run(args[1:]...)
+	case "clear-page":
+		return newClearPageCommand(cmd).Run(args[1:]...)
 	default:
 		return ErrUnknownCommand
 	}
@@ -62,53 +63,9 @@ func (cmd *surgeryCommand) parsePathsAndCopyFile(fs *flag.FlagSet) error {
 		return errors.New("output file required")
 	}
 
-	// Ensure source file exists.
-	_, err := os.Stat(cmd.srcPath)
-	if os.IsNotExist(err) {
-		return ErrFileNotFound
-	} else if err != nil {
-		return err
-	}
-
-	// Ensure output file not exist.
-	_, err = os.Stat(cmd.dstPath)
-	if err == nil {
-		return fmt.Errorf("output file %q already exists", cmd.dstPath)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
 	// Copy database from SrcPath to DstPath
-	if err := copyFile(cmd.srcPath, cmd.dstPath); err != nil {
+	if err := common.CopyFile(cmd.srcPath, cmd.dstPath); err != nil {
 		return fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	return nil
-}
-
-func copyFile(srcPath, dstPath string) error {
-	srcDB, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("failed to open source file %q: %w", srcPath, err)
-	}
-	defer srcDB.Close()
-	dstDB, err := os.Create(dstPath)
-	if err != nil {
-		return fmt.Errorf("failed to create output file %q: %w", dstPath, err)
-	}
-	defer dstDB.Close()
-	written, err := io.Copy(dstDB, srcDB)
-	if err != nil {
-		return fmt.Errorf("failed to copy database file from %q to %q: %w", srcPath, dstPath, err)
-	}
-
-	srcFi, err := srcDB.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to get source file info %q: %w", srcPath, err)
-	}
-	initialSize := srcFi.Size()
-	if initialSize != written {
-		return fmt.Errorf("the byte copied (%q: %d) isn't equal to the initial db size (%q: %d)", dstPath, written, srcPath, initialSize)
 	}
 
 	return nil
@@ -124,8 +81,9 @@ Usage:
 	bbolt surgery command [arguments]
 
 The commands are:
-    copy-page              copy page from source pageid to target pageid	
     help                   print this screen
+    clear-page             clear all elements at the given pageId
+    copy-page              copy page from source pageId to target pageId
     revert-meta-page       revert the meta page change made by the last transaction
 
 Use "bbolt surgery [command] -h" for more information about a command.
@@ -221,11 +179,11 @@ func (cmd *copyPageCommand) Run(args ...string) error {
 	}
 
 	// copy the page
-	if err := surgeon.CopyPage(cmd.dstPath, guts_cli.Pgid(srcPageId), guts_cli.Pgid(dstPageId)); err != nil {
+	if err := surgeon.CopyPage(cmd.dstPath, common.Pgid(srcPageId), common.Pgid(dstPageId)); err != nil {
 		return fmt.Errorf("copyPageCommand failed: %w", err)
 	}
 
-	fmt.Fprintf(cmd.Stdout, "The page %d was copied to page %d", srcPageId, dstPageId)
+	fmt.Fprintf(cmd.Stdout, "The page %d was copied to page %d\n", srcPageId, dstPageId)
 	return nil
 }
 
@@ -237,6 +195,67 @@ usage: bolt surgery copy-page SRC DST srcPageId dstPageid
 CopyPage copies the database file at SRC to a newly created database
 file at DST. Afterwards, it copies the page at srcPageId to the page
 at dstPageId in DST.
+
+The original database is left untouched.
+`, "\n")
+}
+
+// clearPageCommand represents the "surgery clear-page" command execution.
+type clearPageCommand struct {
+	*surgeryCommand
+}
+
+// newClearPageCommand returns a clearPageCommand.
+func newClearPageCommand(m *surgeryCommand) *clearPageCommand {
+	c := &clearPageCommand{}
+	c.surgeryCommand = m
+	return c
+}
+
+// Run executes the command.
+func (cmd *clearPageCommand) Run(args ...string) error {
+	// Parse flags.
+	fs := flag.NewFlagSet("", flag.ContinueOnError)
+	help := fs.Bool("h", false, "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	} else if *help {
+		fmt.Fprintln(cmd.Stderr, cmd.Usage())
+		return ErrUsage
+	}
+
+	if err := cmd.parsePathsAndCopyFile(fs); err != nil {
+		return fmt.Errorf("clearPageCommand failed to parse paths and copy file: %w", err)
+	}
+
+	// Read page id.
+	pageId, err := strconv.ParseUint(fs.Arg(2), 10, 64)
+	if err != nil {
+		return err
+	}
+
+	needAbandonFreelist, err := surgeon.ClearPage(cmd.dstPath, common.Pgid(pageId))
+	if err != nil {
+		return fmt.Errorf("clearPageCommand failed: %w", err)
+	}
+
+	if needAbandonFreelist {
+		fmt.Fprintf(os.Stdout, "WARNING: The clearing has abandoned some pages that are not yet referenced from free list.\n")
+		fmt.Fprintf(os.Stdout, "Please consider executing `./bbolt surgery abandon-freelist ...`\n")
+	}
+
+	fmt.Fprintf(cmd.Stdout, "Page (%d) was cleared\n", pageId)
+	return nil
+}
+
+// Usage returns the help message.
+func (cmd *clearPageCommand) Usage() string {
+	return strings.TrimLeft(`
+usage: bolt surgery clear-page SRC DST pageId
+
+ClearPage copies the database file at SRC to a newly created database
+file at DST. Afterwards, it clears all elements in the page at pageId
+in DST.
 
 The original database is left untouched.
 `, "\n")
