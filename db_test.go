@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -443,7 +444,7 @@ func TestOpen_FileTooSmall(t *testing.T) {
 	}
 
 	_, err = bolt.Open(path, 0666, nil)
-	if err == nil || err.Error() != "file size too small" {
+	if err == nil || !strings.Contains(err.Error(), "file size too small") {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -560,6 +561,12 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	if err := readOnlyDB.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDB_Open_ReadOnly_NoCreate(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "db")
+	_, err := bolt.Open(f, 0666, &bolt.Options{ReadOnly: true})
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 // TestOpen_BigPage checks the database uses bigger pages when

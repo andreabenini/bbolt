@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -14,6 +15,126 @@ import (
 	"go.etcd.io/bbolt/internal/common"
 	"go.etcd.io/bbolt/internal/guts_cli"
 )
+
+func TestSurgery_RevertMetaPage(t *testing.T) {
+	pageSize := 4096
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize})
+	srcPath := db.Path()
+
+	defer requireDBNoChange(t, dbData(t, db.Path()), db.Path())
+
+	srcFile, err := os.Open(srcPath)
+	require.NoError(t, err)
+	defer srcFile.Close()
+
+	// Read both meta0 and meta1 from srcFile
+	srcBuf0 := readPage(t, srcPath, 0, pageSize)
+	srcBuf1 := readPage(t, srcPath, 1, pageSize)
+	meta0Page := common.LoadPageMeta(srcBuf0)
+	meta1Page := common.LoadPageMeta(srcBuf1)
+
+	// Get the non-active meta page
+	nonActiveSrcBuf := srcBuf0
+	nonActiveMetaPageId := 0
+	if meta0Page.Txid() > meta1Page.Txid() {
+		nonActiveSrcBuf = srcBuf1
+		nonActiveMetaPageId = 1
+	}
+	t.Logf("non active meta page id: %d", nonActiveMetaPageId)
+
+	// revert the meta page
+	rootCmd := main.NewRootCommand()
+	output := filepath.Join(t.TempDir(), "db")
+	rootCmd.SetArgs([]string{
+		"surgery", "revert-meta-page", srcPath,
+		"--output", output,
+	})
+	err = rootCmd.Execute()
+	require.NoError(t, err)
+
+	// read both meta0 and meta1 from dst file
+	dstBuf0 := readPage(t, output, 0, pageSize)
+	dstBuf1 := readPage(t, output, 1, pageSize)
+
+	// check result. Note we should skip the page ID
+	assert.Equal(t, pageDataWithoutPageId(nonActiveSrcBuf), pageDataWithoutPageId(dstBuf0))
+	assert.Equal(t, pageDataWithoutPageId(nonActiveSrcBuf), pageDataWithoutPageId(dstBuf1))
+}
+
+func TestSurgery_CopyPage(t *testing.T) {
+	pageSize := 4096
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize})
+	srcPath := db.Path()
+
+	// Insert some sample data
+	t.Log("Insert some sample data")
+	err := db.Fill([]byte("data"), 1, 20,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 10) },
+	)
+	require.NoError(t, err)
+
+	defer requireDBNoChange(t, dbData(t, srcPath), srcPath)
+
+	// copy page 3 to page 2
+	t.Log("copy page 3 to page 2")
+	rootCmd := main.NewRootCommand()
+	output := filepath.Join(t.TempDir(), "dstdb")
+	rootCmd.SetArgs([]string{
+		"surgery", "copy-page", srcPath,
+		"--output", output,
+		"--from-page", "3",
+		"--to-page", "2",
+	})
+	err = rootCmd.Execute()
+	require.NoError(t, err)
+
+	// The page 2 should have exactly the same data as page 3.
+	t.Log("Verify result")
+	srcPageId3Data := readPage(t, srcPath, 3, pageSize)
+	dstPageId3Data := readPage(t, output, 3, pageSize)
+	dstPageId2Data := readPage(t, output, 2, pageSize)
+
+	assert.Equal(t, srcPageId3Data, dstPageId3Data)
+	assert.Equal(t, pageDataWithoutPageId(srcPageId3Data), pageDataWithoutPageId(dstPageId2Data))
+}
+
+// TODO(ahrtr): add test case below for `surgery clear-page` command:
+//  1. The page is a branch page. All its children should become free pages.
+func TestSurgery_ClearPage(t *testing.T) {
+	pageSize := 4096
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize})
+	srcPath := db.Path()
+
+	// Insert some sample data
+	t.Log("Insert some sample data")
+	err := db.Fill([]byte("data"), 1, 20,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 10) },
+	)
+	require.NoError(t, err)
+
+	defer requireDBNoChange(t, dbData(t, srcPath), srcPath)
+
+	// clear page 3
+	t.Log("clear page 3")
+	rootCmd := main.NewRootCommand()
+	output := filepath.Join(t.TempDir(), "dstdb")
+	rootCmd.SetArgs([]string{
+		"surgery", "clear-page", srcPath,
+		"--output", output,
+		"--pageId", "3",
+	})
+	err = rootCmd.Execute()
+	require.NoError(t, err)
+
+	t.Log("Verify result")
+	dstPageId3Data := readPage(t, output, 3, pageSize)
+
+	p := common.LoadPage(dstPageId3Data)
+	assert.Equal(t, uint16(0), p.Count())
+	assert.Equal(t, uint32(0), p.Overflow())
+}
 
 func TestSurgery_ClearPageElements_Without_Overflow(t *testing.T) {
 	testCases := []struct {
@@ -430,105 +551,86 @@ func testSurgeryClearPageElementsWithOverflow(t *testing.T, startIdx, endIdx int
 	compareDataAfterClearingElement(t, srcPath, output, pageId, false, startIdx, endIdx)
 }
 
-func TestSurgery_Freelist_Abandon(t *testing.T) {
-	pageSize := 4096
-	db := btesting.MustCreateDBWithOption(t, &bolt.Options{PageSize: pageSize})
-	srcPath := db.Path()
-
-	defer requireDBNoChange(t, dbData(t, srcPath), srcPath)
-
-	rootCmd := main.NewRootCommand()
-	output := filepath.Join(t.TempDir(), "db")
-	rootCmd.SetArgs([]string{
-		"surgery", "freelist", "abandon", srcPath,
-		"--output", output,
-	})
-	err := rootCmd.Execute()
-	require.NoError(t, err)
-
-	meta0 := loadMetaPage(t, output, 0)
-	assert.Equal(t, common.PgidNoFreelist, meta0.Freelist())
-	meta1 := loadMetaPage(t, output, 1)
-	assert.Equal(t, common.PgidNoFreelist, meta1.Freelist())
-}
-
-func loadMetaPage(t *testing.T, dbPath string, pageID uint64) *common.Meta {
-	_, buf, err := guts_cli.ReadPage(dbPath, 0)
-	require.NoError(t, err)
-	return common.LoadPageMeta(buf)
-}
-
-func TestSurgery_Freelist_Rebuild(t *testing.T) {
+func TestSurgeryRequiredFlags(t *testing.T) {
+	errMsgFmt := `required flag(s) "%s" not set`
 	testCases := []struct {
-		name          string
-		hasFreelist   bool
-		expectedError error
+		name           string
+		args           []string
+		expectedErrMsg string
 	}{
+		// --output is required for all surgery commands
 		{
-			name:          "normal operation",
-			hasFreelist:   false,
-			expectedError: nil,
+			name:           "no output flag for revert-meta-page",
+			args:           []string{"surgery", "revert-meta-page", "db"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
 		},
 		{
-			name:          "already has freelist",
-			hasFreelist:   true,
-			expectedError: main.ErrSurgeryFreelistAlreadyExist,
+			name:           "no output flag for copy-page",
+			args:           []string{"surgery", "copy-page", "db", "--from-page", "3", "--to-page", "2"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
+		},
+		{
+			name:           "no output flag for clear-page",
+			args:           []string{"surgery", "clear-page", "db", "--pageId", "3"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
+		},
+		{
+			name:           "no output flag for clear-page-element",
+			args:           []string{"surgery", "clear-page-elements", "db", "--pageId", "4", "--from-index", "3", "--to-index", "5"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
+		},
+		{
+			name:           "no output flag for freelist abandon",
+			args:           []string{"surgery", "freelist", "abandon", "db"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
+		},
+		{
+			name:           "no output flag for freelist rebuild",
+			args:           []string{"surgery", "freelist", "rebuild", "db"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "output"),
+		},
+		// --from-page and --to-page are required for 'surgery copy-page' command
+		{
+			name:           "no from-page flag for copy-page",
+			args:           []string{"surgery", "copy-page", "db", "--output", "db", "--to-page", "2"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "from-page"),
+		},
+		{
+			name:           "no to-page flag for copy-page",
+			args:           []string{"surgery", "copy-page", "db", "--output", "db", "--from-page", "2"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "to-page"),
+		},
+		// --pageId is required for 'surgery clear-page' command
+		{
+			name:           "no pageId flag for clear-page",
+			args:           []string{"surgery", "clear-page", "db", "--output", "db"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "pageId"),
+		},
+		// --pageId, --from-index and --to-index are required for 'surgery clear-page-element' command
+		{
+			name:           "no pageId flag for clear-page-element",
+			args:           []string{"surgery", "clear-page-elements", "db", "--output", "newdb", "--from-index", "3", "--to-index", "5"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "pageId"),
+		},
+		{
+			name:           "no from-index flag for clear-page-element",
+			args:           []string{"surgery", "clear-page-elements", "db", "--output", "newdb", "--pageId", "2", "--to-index", "5"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "from-index"),
+		},
+		{
+			name:           "no to-index flag for clear-page-element",
+			args:           []string{"surgery", "clear-page-elements", "db", "--output", "newdb", "--pageId", "2", "--from-index", "3"},
+			expectedErrMsg: fmt.Sprintf(errMsgFmt, "to-index"),
 		},
 	}
 
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			pageSize := 4096
-			db := btesting.MustCreateDBWithOption(t, &bolt.Options{
-				PageSize:       pageSize,
-				NoFreelistSync: !tc.hasFreelist,
-			})
-			srcPath := db.Path()
-
-			err := db.Update(func(tx *bolt.Tx) error {
-				// do nothing
-				return nil
-			})
-			require.NoError(t, err)
-
-			defer requireDBNoChange(t, dbData(t, srcPath), srcPath)
-
-			// Verify the freelist isn't synced in the beginning
-			meta := readMetaPage(t, srcPath)
-			if tc.hasFreelist {
-				if meta.Freelist() <= 1 || meta.Freelist() >= meta.Pgid() {
-					t.Fatalf("freelist (%d) isn't in the valid range (1, %d)", meta.Freelist(), meta.Pgid())
-				}
-			} else {
-				require.Equal(t, common.PgidNoFreelist, meta.Freelist())
-			}
-
-			// Execute `surgery freelist rebuild` command
 			rootCmd := main.NewRootCommand()
-			output := filepath.Join(t.TempDir(), "db")
-			rootCmd.SetArgs([]string{
-				"surgery", "freelist", "rebuild", srcPath,
-				"--output", output,
-			})
-			err = rootCmd.Execute()
-			require.Equal(t, tc.expectedError, err)
-
-			if tc.expectedError == nil {
-				// Verify the freelist has already been rebuilt.
-				meta = readMetaPage(t, output)
-				if meta.Freelist() <= 1 || meta.Freelist() >= meta.Pgid() {
-					t.Fatalf("freelist (%d) isn't in the valid range (1, %d)", meta.Freelist(), meta.Pgid())
-				}
-			}
+			rootCmd.SetArgs(tc.args)
+			err := rootCmd.Execute()
+			require.ErrorContains(t, err, tc.expectedErrMsg)
 		})
 	}
-}
-
-func readMetaPage(t *testing.T, path string) *common.Meta {
-	_, activeMetaPageId, err := guts_cli.GetRootPage(path)
-	require.NoError(t, err)
-	_, buf, err := guts_cli.ReadPage(path, uint64(activeMetaPageId))
-	require.NoError(t, err)
-	return common.LoadPageMeta(buf)
 }

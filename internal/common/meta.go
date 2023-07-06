@@ -49,7 +49,7 @@ func (m *Meta) Write(p *Page) {
 
 	// Page id is either going to be 0 or 1 which we can determine by the transaction ID.
 	p.id = Pgid(m.txid % 2)
-	p.flags |= MetaPageFlag
+	p.SetFlags(MetaPageFlag)
 
 	// Calculate the checksum.
 	m.checksum = m.Sum64()
@@ -106,6 +106,10 @@ func (m *Meta) Freelist() Pgid {
 
 func (m *Meta) SetFreelist(v Pgid) {
 	m.freelist = v
+}
+
+func (m *Meta) IsFreelistPersisted() bool {
+	return m.freelist != PgidNoFreelist
 }
 
 func (m *Meta) Pgid() Pgid {
