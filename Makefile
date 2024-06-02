@@ -42,14 +42,14 @@ lint:
 .PHONY: test
 test:
 	@echo "hashmap freelist test"
-	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout ${TESTFLAGS_TIMEOUT}
-	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} ./internal/...
-	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} ./cmd/bbolt
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout ${TESTFLAGS_TIMEOUT}
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} ./internal/...
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} ./cmd/bbolt
 
 	@echo "array freelist test"
-	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout ${TESTFLAGS_TIMEOUT}
-	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} ./internal/...
-	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} ./cmd/bbolt
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout ${TESTFLAGS_TIMEOUT}
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} ./internal/...
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} ./cmd/bbolt
 
 .PHONY: coverage
 coverage:
@@ -60,6 +60,15 @@ coverage:
 	@echo "array freelist test"
 	TEST_FREELIST_TYPE=array go test -v -timeout ${TESTFLAGS_TIMEOUT} \
 		-coverprofile cover-freelist-array.out -covermode atomic
+
+BOLT_CMD=bbolt
+
+build:
+	go build -o bin/${BOLT_CMD} ./cmd/${BOLT_CMD}
+
+.PHONY: clean
+clean: # Clean binaries
+	rm -f ./bin/${BOLT_CMD}
 
 .PHONY: gofail-enable
 gofail-enable: install-gofail
@@ -76,8 +85,12 @@ install-gofail:
 .PHONY: test-failpoint
 test-failpoint:
 	@echo "[failpoint] hashmap freelist test"
-	TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=hashmap go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
 
 	@echo "[failpoint] array freelist test"
-	TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
+	BBOLT_VERIFY=all TEST_FREELIST_TYPE=array go test -v ${TESTFLAGS} -timeout 30m ./tests/failpoint
 
+.PHONY: test-robustness # Running robustness tests requires root permission
+test-robustness: gofail-enable build
+	sudo env PATH=$$PATH go test -v ${TESTFLAGS} ./tests/dmflakey -test.root
+	sudo env PATH=$(PWD)/bin:$$PATH go test -v ${TESTFLAGS} ${ROBUSTNESS_TESTFLAGS} ./tests/robustness -test.root
