@@ -1,16 +1,16 @@
 module go.etcd.io/bbolt
 
-go 1.22
+go 1.23
 
-toolchain go1.22.5
+toolchain go1.23.6
 
 require (
 	github.com/spf13/cobra v1.8.1
-	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.9.0
+	github.com/spf13/pflag v1.0.6
+	github.com/stretchr/testify v1.10.0
 	go.etcd.io/gofail v0.2.0
-	golang.org/x/sync v0.7.0
-	golang.org/x/sys v0.22.0
+	golang.org/x/sync v0.10.0
+	golang.org/x/sys v0.29.0
 )
 
 require (
