@@ -1080,7 +1080,7 @@ func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 // then it allows you to force the database file to sync against the disk.
 func (db *DB) Sync() (err error) {
 	if lg := db.Logger(); lg != discardLogger {
-		lg.Debug("Syncing bbolt db (%s)", db.path)
+		lg.Debugf("Syncing bbolt db (%s)", db.path)
 		defer func() {
 			if err != nil {
 				lg.Errorf("[GOOS: %s, GOARCH: %s] syncing bbolt db (%s) failed: %v", runtime.GOOS, runtime.GOARCH, db.path, err)
@@ -1309,6 +1309,12 @@ type Options struct {
 	// If <=0, the initial map size is 0.
 	// If initialMmapSize is smaller than the previous database size,
 	// it takes no effect.
+	//
+	// Note: On Windows, due to platform limitations, the database file size
+	// will be immediately resized to match `InitialMmapSize` (aligned to page size)
+	// when the DB is opened. On non-Windows platforms, the file size will grow
+	// dynamically based on the actual amount of written data, regardless of `InitialMmapSize`.
+	// Refer to https://github.com/etcd-io/bbolt/issues/378#issuecomment-1378121966.
 	InitialMmapSize int
 
 	// PageSize overrides the default OS page size.

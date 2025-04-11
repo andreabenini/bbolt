@@ -1,21 +1,21 @@
 ---
-name: Tests AMD64
+name: Tests ARM64
 permissions: read-all
 on: [push, pull_request]
 jobs:
-  test-linux-amd64:
+  test-linux-arm64:
     uses: ./.github/workflows/tests-template.yml
-  test-linux-amd64-race:
+  test-linux-arm64-race:
     uses: ./.github/workflows/tests-template.yml
     with:
-      runs-on: ubuntu-latest
+      runs-on: ubuntu-24.04-arm
       targets: "['linux-unit-test-4-cpu-race']"
 
   coverage:
     needs:
-      - test-linux-amd64
-      - test-linux-amd64-race
-    runs-on: ubuntu-latest
+      - test-linux-arm64
+      - test-linux-arm64-race
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - id: goversion
