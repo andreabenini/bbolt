@@ -19,11 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"go.etcd.io/bbolt/tests/dmflakey"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"go.etcd.io/bbolt/tests/dmflakey"
 )
 
 var panicFailpoints = []string{
@@ -140,17 +140,17 @@ func TestRestartFromPowerFailureXFS(t *testing.T) {
 }
 
 func doPowerFailure(t *testing.T, du time.Duration, fsType dmflakey.FSType, mkfsOpt string, fsMountOpt string, useFailpoint bool) {
-	flakey := initFlakeyDevice(t, strings.Replace(t.Name(), "/", "_", -1), fsType, mkfsOpt, fsMountOpt)
+	flakey := initFlakeyDevice(t, strings.ReplaceAll(t.Name(), "/", "_"), fsType, mkfsOpt, fsMountOpt)
 	root := flakey.RootFS()
 
 	dbPath := filepath.Join(root, "boltdb")
 
 	args := []string{"bbolt", "bench",
-		"-work", // keep the database
-		"-path", dbPath,
-		"-count=1000000000",
-		"-batch-size=5", // separate total count into multiple truncation
-		"-value-size=512",
+		"--work", // keep the database
+		"--path", dbPath,
+		"--count=1000000000",
+		"--batch-size=5", // separate total count into multiple truncation
+		"--value-size=512",
 	}
 
 	logPath := filepath.Join(t.TempDir(), fmt.Sprintf("%s.log", t.Name()))
