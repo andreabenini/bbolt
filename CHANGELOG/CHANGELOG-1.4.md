@@ -7,6 +7,10 @@
 - Fix [`Bucket.Stats()` panic on branch pages with zero elements](https://github.com/etcd-io/bbolt/pull/1172)
 - [Improve performance by replacing Assert checks](https://github.com/etcd-io/bbolt/pull/1183)
 
+### CMD
+- [Reject compacting a database onto itself](https://github.com/etcd-io/bbolt/pull/1296)
+- [Reject out of range item ids in page-item](https://github.com/etcd-io/bbolt/pull/1328)
+
 <hr>
 
 ## v1.4.3(2025-08-19)

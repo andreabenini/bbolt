@@ -8,6 +8,10 @@ Note that we start to track changes starting from v1.3.7.
 - Fix [`Bucket.Stats()` panic on branch pages with zero elements](https://github.com/etcd-io/bbolt/pull/1173)
 - [Support Android platform](https://github.com/etcd-io/bbolt/pull/1161)
 
+### CMD
+- [Reject compacting a database onto itself](https://github.com/etcd-io/bbolt/pull/1297)
+- [Reject out of range item ids in page-item](https://github.com/etcd-io/bbolt/pull/1329)
+
 <hr>
 
 ## v1.3.12(2025-08-19)
